@@ -484,10 +484,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             diffused_actions = forward_inputs.get("diffused_actions") if isinstance(forward_inputs, dict) else None
             if diffused_actions is not None:
                 with torch.no_grad():
+                    # Inject tokenized_prompt into obs for diffusion (stored in forward_inputs)
+                    diffuse_next_obs = dict(next_obs)
+                    if "tokenized_prompt" not in diffuse_next_obs and "tokenized_prompt" in forward_inputs:
+                        diffuse_next_obs["tokenized_prompt"] = forward_inputs["tokenized_prompt"]
+                        diffuse_next_obs["tokenized_prompt_mask"] = forward_inputs["tokenized_prompt_mask"]
                     # Run frozen diffusion to get next diffused actions
                     next_diffused_actions = self.model(
                         forward_type=ForwardType.DSRL_DIFFUSE,
-                        obs=next_obs,
+                        obs=diffuse_next_obs,
                         noise_actions=next_state_actions,
                     )
                     # Action-space target Q from target model
