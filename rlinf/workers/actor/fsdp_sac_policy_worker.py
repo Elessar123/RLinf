@@ -107,12 +107,22 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.target_model_initialized = True
 
         self.use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
+        self.dsrl_use_vlm_features = self.cfg.actor.model.get("openpi", {}).get(
+            "dsrl_use_vlm_features", False
+        )
+        self.dsrl_use_distillation = self.cfg.actor.model.get("openpi", {}).get(
+            "dsrl_use_distillation", False
+        )
         use_dsrl = self.use_dsrl
         if use_dsrl:
-            # DSRL: separate actor/critic encoders into different optimizer groups
-            param_filters = {
-                "critic": ["critic_image_encoder", "critic_state_encoder", "q_head"]
-            }
+            if self.dsrl_use_vlm_features:
+                # VLM-based DSRL: no lightweight encoders, only q_head is critic
+                param_filters = {"critic": ["q_head"]}
+            else:
+                # Original lightweight DSRL: separate actor/critic encoders
+                param_filters = {
+                    "critic": ["critic_image_encoder", "critic_state_encoder", "q_head"]
+                }
         else:
             param_filters = {"critic": ["encoders", "encoder", "q_head", "state_proj"]}
         filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
@@ -466,7 +476,60 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         critic_loss = F.mse_loss(
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
-        return critic_loss, {"q_data": all_data_q_values.mean().item()}
+        metrics = {"q_data": all_data_q_values.mean().item()}
+
+        # ===== DSRL distillation: action-space critic with its own bootstrap =====
+        if self.dsrl_use_distillation:
+            forward_inputs = batch.get("forward_inputs", {})
+            diffused_actions = forward_inputs.get("diffused_actions") if isinstance(forward_inputs, dict) else None
+            if diffused_actions is not None:
+                with torch.no_grad():
+                    # Run frozen diffusion to get next diffused actions
+                    next_diffused_actions = self.model(
+                        forward_type=ForwardType.DSRL_DIFFUSE,
+                        obs=next_obs,
+                        noise_actions=next_state_actions,
+                    )
+                    # Action-space target Q from target model
+                    all_qf_next_action_target = self.target_model(
+                        forward_type=ForwardType.DSRL_DISTILL_Q,
+                        obs=next_obs,
+                        actions=next_diffused_actions,
+                        train=True,
+                    )
+                    if agg_q == "min":
+                        qf_next_action, _ = torch.min(all_qf_next_action_target, dim=1, keepdim=True)
+                    elif agg_q == "mean":
+                        qf_next_action = torch.mean(all_qf_next_action_target, dim=1, keepdim=True)
+                    if self.cfg.algorithm.get("backup_entropy", True):
+                        qf_next_action = qf_next_action - self.entropy_temp.alpha * next_state_log_pi
+                        qf_next_action = qf_next_action.to(dtype=self.torch_dtype)
+                    if bootstrap_type == "standard":
+                        target_q_action = (
+                            rewards_for_bootstrap
+                            + (~(terminations.any(dim=-1, keepdim=True)))
+                            * discount
+                            * qf_next_action
+                        )
+                    else:
+                        target_q_action = rewards_for_bootstrap + discount * qf_next_action
+
+                # Current Q in action space
+                all_data_q_action = self.model(
+                    forward_type=ForwardType.DSRL_DISTILL_Q,
+                    obs=curr_obs,
+                    actions=diffused_actions,
+                    train=True,
+                )
+                target_q_action = target_q_action.to(dtype=all_data_q_action.dtype)
+                action_critic_loss = F.mse_loss(
+                    all_data_q_action, target_q_action.expand_as(all_data_q_action)
+                )
+                critic_loss = critic_loss + action_critic_loss
+                metrics["q_action"] = all_data_q_action.mean().item()
+                metrics["action_critic_loss"] = action_critic_loss.item()
+
+        return critic_loss, metrics
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):

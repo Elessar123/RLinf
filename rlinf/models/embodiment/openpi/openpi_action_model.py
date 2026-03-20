@@ -78,6 +78,21 @@ class OpenPi0Config(Pi0Config):
         default_factory=lambda: (128, 128, 128)
     )  # Hidden dims for Q-head and GaussianPolicy
 
+    # ===== VLM-based DSRL parameters (multi-task) =====
+    dsrl_use_vlm_features: bool = False  # Use VLM features instead of lightweight encoders
+    dsrl_vlm_feature_dim: int = 2048  # VLM feature dimension (Pi0.5 width)
+    dsrl_vlm_hidden_dims: tuple = field(
+        default_factory=lambda: (1024, 512, 256)
+    )  # Larger hidden dims for VLM-based actor/critic
+
+    # ===== DSRL distillation parameters =====
+    dsrl_use_distillation: bool = False  # Enable noise critic distillation
+    dsrl_distill_num_q_heads: int = 10  # Number of Q-heads for action-space critic
+    dsrl_distill_q_hidden_dims: tuple = field(
+        default_factory=lambda: (1024, 512, 256)
+    )
+    dsrl_noise_critic_grad_steps: int = 1  # Distillation steps per update
+
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     """
@@ -187,45 +202,97 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # its FlatParameter, avoiding the writeback shape-mismatch error.
             _dsrl_dtype = torch.bfloat16
 
-            dsrl_input_dim = (
-                self.config.dsrl_state_latent_dim + self.config.dsrl_image_latent_dim
-            )  # e.g. 64 + 64 = 128
+            if self.config.dsrl_use_vlm_features:
+                # ---- VLM-based DSRL (multi-task) ----
+                # Actor and critic use frozen VLM prefix features (2048-dim)
+                # instead of lightweight image/state encoders.
+                vlm_dim = self.config.dsrl_vlm_feature_dim  # 2048
+                vlm_hidden = self.config.dsrl_vlm_hidden_dims  # (1024, 512, 256)
 
-            self.dsrl_action_noise_net = GaussianPolicy(
-                input_dim=dsrl_input_dim,
-                output_dim=self.config.dsrl_action_noise_dim,
-                hidden_dims=self.config.dsrl_hidden_dims,
-                low=None,
-                high=None,
-                action_horizon=self.config.action_horizon,
-            ).to(dtype=_dsrl_dtype)
+                self.dsrl_action_noise_net = GaussianPolicy(
+                    input_dim=vlm_dim,
+                    output_dim=self.config.dsrl_action_noise_dim,
+                    hidden_dims=vlm_hidden,
+                    low=None,
+                    high=None,
+                    action_horizon=self.config.action_horizon,
+                ).to(dtype=_dsrl_dtype)
 
-            self.actor_image_encoder = LightweightImageEncoder64(
-                num_images=1,
-                latent_dim=self.config.dsrl_image_latent_dim,
-                image_size=64,
-            ).to(dtype=_dsrl_dtype)
-            self.actor_state_encoder = CompactStateEncoder(
-                state_dim=self.config.dsrl_state_dim,
-                hidden_dim=self.config.dsrl_state_latent_dim,
-            ).to(dtype=_dsrl_dtype)
-            self.critic_image_encoder = LightweightImageEncoder64(
-                num_images=1,
-                latent_dim=self.config.dsrl_image_latent_dim,
-                image_size=64,
-            ).to(dtype=_dsrl_dtype)
-            self.critic_state_encoder = CompactStateEncoder(
-                state_dim=self.config.dsrl_state_dim,
-                hidden_dim=self.config.dsrl_state_latent_dim,
-            ).to(dtype=_dsrl_dtype)
-            self.q_head = CompactMultiQHead(
-                state_dim=self.config.dsrl_state_latent_dim,
-                image_dim=self.config.dsrl_image_latent_dim,
-                action_dim=self.config.dsrl_action_noise_dim,
-                hidden_dims=self.config.dsrl_hidden_dims,
-                num_q_heads=self.config.dsrl_num_q_heads,
-                output_dim=1,
-            ).to(dtype=_dsrl_dtype)
+                self.q_head = CompactMultiQHead(
+                    state_dim=0,  # no separate state — VLM features encode everything
+                    image_dim=vlm_dim,  # VLM features go through image_dim slot
+                    action_dim=self.config.dsrl_action_noise_dim,
+                    hidden_dims=vlm_hidden,
+                    num_q_heads=self.config.dsrl_num_q_heads,
+                    output_dim=1,
+                ).to(dtype=_dsrl_dtype)
+
+                # Distillation: action-space critic (teacher for noise critic)
+                if self.config.dsrl_use_distillation:
+                    action_input_dim = self.config.action_env_dim * self.config.action_chunk
+                    self.q_head_action = CompactMultiQHead(
+                        state_dim=0,
+                        image_dim=vlm_dim,
+                        action_dim=action_input_dim,
+                        hidden_dims=self.config.dsrl_distill_q_hidden_dims,
+                        num_q_heads=self.config.dsrl_distill_num_q_heads,
+                        output_dim=1,
+                    ).to(dtype=_dsrl_dtype)
+
+                # No lightweight encoders needed — VLM provides task-aware features
+            else:
+                # ---- Original lightweight DSRL (single-task) ----
+                dsrl_input_dim = (
+                    self.config.dsrl_state_latent_dim + self.config.dsrl_image_latent_dim
+                )  # e.g. 64 + 64 = 128
+
+                self.dsrl_action_noise_net = GaussianPolicy(
+                    input_dim=dsrl_input_dim,
+                    output_dim=self.config.dsrl_action_noise_dim,
+                    hidden_dims=self.config.dsrl_hidden_dims,
+                    low=None,
+                    high=None,
+                    action_horizon=self.config.action_horizon,
+                ).to(dtype=_dsrl_dtype)
+
+                self.actor_image_encoder = LightweightImageEncoder64(
+                    num_images=1,
+                    latent_dim=self.config.dsrl_image_latent_dim,
+                    image_size=64,
+                ).to(dtype=_dsrl_dtype)
+                self.actor_state_encoder = CompactStateEncoder(
+                    state_dim=self.config.dsrl_state_dim,
+                    hidden_dim=self.config.dsrl_state_latent_dim,
+                ).to(dtype=_dsrl_dtype)
+                self.critic_image_encoder = LightweightImageEncoder64(
+                    num_images=1,
+                    latent_dim=self.config.dsrl_image_latent_dim,
+                    image_size=64,
+                ).to(dtype=_dsrl_dtype)
+                self.critic_state_encoder = CompactStateEncoder(
+                    state_dim=self.config.dsrl_state_dim,
+                    hidden_dim=self.config.dsrl_state_latent_dim,
+                ).to(dtype=_dsrl_dtype)
+                self.q_head = CompactMultiQHead(
+                    state_dim=self.config.dsrl_state_latent_dim,
+                    image_dim=self.config.dsrl_image_latent_dim,
+                    action_dim=self.config.dsrl_action_noise_dim,
+                    hidden_dims=self.config.dsrl_hidden_dims,
+                    num_q_heads=self.config.dsrl_num_q_heads,
+                    output_dim=1,
+                ).to(dtype=_dsrl_dtype)
+
+                # Distillation: action-space critic for lightweight DSRL
+                if self.config.dsrl_use_distillation:
+                    action_input_dim = self.config.action_env_dim * self.config.action_chunk
+                    self.q_head_action = CompactMultiQHead(
+                        state_dim=self.config.dsrl_state_latent_dim,
+                        image_dim=self.config.dsrl_image_latent_dim,
+                        action_dim=action_input_dim,
+                        hidden_dims=self.config.dsrl_distill_q_hidden_dims,
+                        num_q_heads=self.config.dsrl_distill_num_q_heads,
+                        output_dim=1,
+                    ).to(dtype=_dsrl_dtype)
 
         for name, module in self.named_modules():
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
@@ -313,6 +380,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.sac_forward(**kwargs)
         elif forward_type == ForwardType.SAC_Q:
             return self.sac_q_forward(**kwargs)
+        elif forward_type == ForwardType.DSRL_DISTILL_Q:
+            return self.dsrl_distill_q_forward(**kwargs)
+        elif forward_type == ForwardType.DSRL_DIFFUSE:
+            return self.dsrl_diffuse_actions(**kwargs)
         else:
             raise NotImplementedError
 
@@ -497,11 +568,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         observation = _model.Observation.from_dict(processed_obs)
 
         is_dsrl_active = self.config.use_dsrl
+        # Pre-compute VLM features for VLM-based DSRL
+        vlm_features = None
+        if is_dsrl_active and self.config.dsrl_use_vlm_features:
+            vlm_features = self.compute_vlm_features(observation)
+
         if is_dsrl_active:
             # DSRL mode (both train and eval)
 
             # Step 1: SAC agent outputs noise
-            dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
+            if self.config.dsrl_use_vlm_features:
+                dsrl_obs = {"vlm_features": vlm_features}
+            else:
+                dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
 
             noise_actions, noise_logprob, _ = self.sac_forward(
                 dsrl_obs, train=False, mode=mode
@@ -526,6 +605,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             prev_values = outputs.get("prev_values")
             forward_action = noise_actions  # Used for SAC training
 
+            # Store diffused actions for distillation (normalized, in openpi space)
+            if self.config.dsrl_use_distillation:
+                diffused_actions = outputs["actions"][
+                    :, : self.config.action_chunk, : self.config.action_env_dim
+                ]
+
         else:
             # Non-DSRL or eval mode
             outputs = self.sample_actions(
@@ -543,16 +628,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "denoise_inds": outputs["denoise_inds"],
             "tokenized_prompt": processed_obs["tokenized_prompt"],
             "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
-            # "action" is the env-executed action, and "model_action" is the original output by the model.
-            # For small models, they are consistent. For large models (like pi), "action" is the result after output_transform.
-            # For realworld human-in-the-loop training, only "action" can be provided by human.
-            "action": actions.reshape(actions.shape[0], -1).contiguous(),
-            "model_action": outputs["actions"]
-            .reshape(outputs["actions"].shape[0], -1)
-            .contiguous(),
         }
         if forward_action is not None:
             forward_inputs["action"] = forward_action
+        # Store diffused actions in forward_inputs for distillation
+        if is_dsrl_active and self.config.dsrl_use_distillation:
+            forward_inputs["diffused_actions"] = diffused_actions
 
         # Clone observations to avoid cross-step reference issues.
         cloned_obs = copy_dict_tensor(
@@ -565,6 +646,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_values": prev_values,
             "forward_inputs": forward_inputs,
         }
+        # Cache VLM features for replay buffer (VLM-based DSRL)
+        if vlm_features is not None:
+            result["vlm_features"] = vlm_features.detach().cpu()
+        # Cache tokenized prompt for DSRL distillation replay buffer
+        if is_dsrl_active and self.config.dsrl_use_distillation:
+            result["tokenized_prompt"] = processed_obs["tokenized_prompt"].detach().cpu()
+            result["tokenized_prompt_mask"] = processed_obs["tokenized_prompt_mask"].detach().cpu()
         return actions, result
 
     @torch.no_grad()
@@ -978,6 +1066,169 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         entropy = 0.5 * torch.log(2 * math.pi * math.e * (sigma_safe**2))
         return entropy
 
+    # ===== VLM feature extraction for DSRL (multi-task) =====
+
+    @torch.no_grad()
+    def compute_vlm_features(self, observation):
+        """Run VLM prefix and extract mean-pooled features for DSRL.
+
+        Used during rollout to pre-compute features that are cached in
+        the replay buffer for off-policy SAC training.
+
+        Args:
+            observation: _model.Observation with images, state, tokens.
+
+        Returns:
+            vlm_features: [B, vlm_feature_dim] mean-pooled VLM features.
+        """
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        # Must use eager attention to avoid SDPA dtype mismatch (same as sample_actions)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+
+        (prefix_output, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+        )
+        return self._extract_vlm_features(prefix_output)
+
+    def _extract_vlm_features(self, prefix_output):
+        """Mean-pool active VLM prefix tokens into a fixed-dim feature vector.
+
+        Args:
+            prefix_output: [B, T, D] from VLM prefix forward.
+
+        Returns:
+            features: [B, D] mean-pooled features.
+        """
+        num_images = self.config.num_images_in_input
+        if "pi05_" in self.config.config_name:
+            lang_token_len = 200
+        elif "pi0_" in self.config.config_name:
+            lang_token_len = 48
+        else:
+            lang_token_len = 200  # default to pi05
+
+        prefix_mask = (
+            [True] * 256 * num_images
+            + [False] * 256 * (3 - num_images)
+            + [True] * lang_token_len
+        )
+        features = prefix_output[:, prefix_mask, :]
+        features = features.mean(dim=1, keepdim=False)  # [B, D]
+        return features
+
+    # ===== DSRL diffusion and distillation methods =====
+
+    @torch.no_grad()
+    def dsrl_diffuse_actions(self, obs, noise_actions):
+        """Run frozen diffusion model to convert noise → real actions during training.
+
+        Args:
+            obs: Replay buffer obs dict with "main_images", "states",
+                 "tokenized_prompt", "tokenized_prompt_mask", etc.
+            noise_actions: [B, action_horizon, noise_dim] from sac_forward
+
+        Returns:
+            diffused_actions: [B, action_chunk, action_env_dim] normalized real actions
+        """
+        to_process = {
+            "observation/image": obs["main_images"],
+            "observation/state": obs["states"],
+            "tokenized_prompt": obs["tokenized_prompt"],
+            "tokenized_prompt_mask": obs["tokenized_prompt_mask"],
+        }
+        if obs.get("wrist_images") is not None:
+            to_process["observation/wrist_image"] = obs["wrist_images"]
+
+        processed = self.input_transform(to_process, transpose=False)
+        processed = self.precision_processor(processed)
+        observation = _model.Observation.from_dict(processed)
+
+        outputs = self.sample_actions(
+            observation, noise=noise_actions, mode="eval", compute_values=False
+        )
+        diffused_actions = outputs["actions"][
+            :, : self.config.action_chunk, : self.config.action_env_dim
+        ]
+        return diffused_actions
+
+    def dsrl_distill_q_forward(
+        self,
+        obs=None,
+        actions=None,
+        detach_encoder=False,
+        train=False,
+        **kwargs,
+    ):
+        """Q-value forward for action-space critic (teacher) used in distillation.
+
+        Args:
+            obs: {"vlm_features": [B, vlm_dim]} for VLM mode, or
+                 {"images": [...], "states": ...} / {"main_images": ..., "states": ...} for lightweight mode.
+            actions: [B, action_chunk, action_env_dim] real diffused actions
+            detach_encoder: Whether to detach encoder features.
+
+        Returns:
+            q_values: [B, num_q_heads]
+        """
+        if not (self.config.use_dsrl and self.config.dsrl_use_distillation):
+            raise ValueError("dsrl_distill_q_forward called but distillation not enabled")
+
+        device = next(self.q_head_action.parameters()).device
+        actions = actions.to(device=device, dtype=torch.bfloat16)
+
+        # Flatten: [B, chunk, dim] -> [B, chunk*dim]
+        if actions.dim() == 3:
+            actions = actions.reshape(actions.shape[0], -1)
+
+        if self.config.dsrl_use_vlm_features:
+            # ---- VLM-based DSRL ----
+            vlm_features = obs.get("vlm_features")
+            if vlm_features is None:
+                raise ValueError("dsrl_distill_q_forward: obs has no 'vlm_features'.")
+            vlm_features = vlm_features.to(device=device, dtype=torch.bfloat16)
+            if detach_encoder:
+                vlm_features = vlm_features.detach()
+
+            bsize = vlm_features.shape[0]
+            empty_state = torch.empty(bsize, 0, device=device, dtype=torch.bfloat16)
+            q_values = self.q_head_action(empty_state, vlm_features, actions)
+        else:
+            # ---- Lightweight DSRL ----
+            if "images" not in obs:
+                if "main_images" in obs:
+                    obs = {"images": [obs["main_images"]], "states": obs["states"]}
+                else:
+                    raise ValueError(
+                        f"dsrl_distill_q_forward: invalid obs format: {obs.keys()}"
+                    )
+            images = self._preprocess_dsrl_images(obs["images"], train=train)
+            states = self._preprocess_states(obs["states"])
+            images = images.to(device=device, dtype=torch.bfloat16)
+            states = states.to(device=device, dtype=torch.bfloat16)
+
+            image_features = self.critic_image_encoder(images)
+            state_features = self.critic_state_encoder(states)
+            if detach_encoder:
+                image_features = image_features.detach()
+                state_features = state_features.detach()
+
+            q_values = self.q_head_action(state_features, image_features, actions)
+
+        return q_values
+
     def freeze_vlm(self):
         if self.config.train_expert_only:
             # Base freeze: paligemma (SigLIP vision encoder + Gemma)
@@ -1064,46 +1315,44 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if not self.config.use_dsrl:
             raise ValueError("sac_forward called but use_dsrl=False")
 
-        # Support both call styles: obs (new, from sac_dsrl) or data (legacy)
         if obs is None:
             obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
 
-        # Handle two obs formats:
-        # Format 1 (internal): {"images": [...], "states": ...}
-        # Format 2 (env): {"main_images": ..., "wrist_images": ..., "states": ...}
-        if "images" not in obs:
-            # Convert env format to internal format
-            if "main_images" in obs:
-                obs = {"images": [obs["main_images"]], "states": obs["states"]}
-            else:
-                raise ValueError(
-                    f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
-                )
-
-        # Preprocess images: resize to 64x64, use only agentview camera
-        # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
-        images = self._preprocess_dsrl_images(obs["images"], train=train)
-        states = self._preprocess_states(obs["states"])
-
-        # Move to the same device as actor encoders, convert to bfloat16
-        device = next(self.actor_image_encoder.parameters()).device
-        images = images.to(device=device, dtype=torch.bfloat16)
-        states = states.to(device=device, dtype=torch.bfloat16)
-
-        # Extract features (using actor's independent encoder)
-        image_features = self.actor_image_encoder(images)  # [B, 64]
-        state_features = self.actor_state_encoder(states)  # [B, 64]
-        features = torch.cat([state_features, image_features], dim=-1)  # [B, 128]
-
-        # Sample from GaussianPolicy
         mode = kwargs.get("mode", "train")
         deterministic = mode == "eval"
+
+        if self.config.dsrl_use_vlm_features:
+            # ---- VLM-based DSRL: use pre-computed VLM features ----
+            vlm_features = obs.get("vlm_features")
+            if vlm_features is None:
+                raise ValueError(
+                    "sac_forward: dsrl_use_vlm_features=True but obs has no 'vlm_features'. "
+                    "Ensure VLM features are cached during rollout."
+                )
+            device = next(self.dsrl_action_noise_net.parameters()).device
+            features = vlm_features.to(device=device, dtype=torch.bfloat16)
+        else:
+            # ---- Original lightweight DSRL ----
+            if "images" not in obs:
+                if "main_images" in obs:
+                    obs = {"images": [obs["main_images"]], "states": obs["states"]}
+                else:
+                    raise ValueError(
+                        f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
+                    )
+            images = self._preprocess_dsrl_images(obs["images"], train=train)
+            states = self._preprocess_states(obs["states"])
+            device = next(self.actor_image_encoder.parameters()).device
+            images = images.to(device=device, dtype=torch.bfloat16)
+            states = states.to(device=device, dtype=torch.bfloat16)
+            image_features = self.actor_image_encoder(images)  # [B, 64]
+            state_features = self.actor_state_encoder(states)  # [B, 64]
+            features = torch.cat([state_features, image_features], dim=-1)  # [B, 128]
 
         action_noise, logprobs = self.dsrl_action_noise_net.sample(
             features, deterministic=deterministic
         )
 
-        # Optional: return distribution parameters for logging
         dist_params = None
         if return_dist_params:
             dist = self.dsrl_action_noise_net.forward(features)
@@ -1138,50 +1387,59 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if not self.config.use_dsrl:
             raise ValueError("sac_q_forward called but use_dsrl=False")
 
-        # Support both call styles: obs (new, from sac_dsrl) or data (legacy)
         if obs is None:
             obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
         if actions is None:
             actions = kwargs.get("actions")
 
-        # Handle two obs formats:
-        # Format 1 (internal): {"images": [...], "states": ...}
-        # Format 2 (env): {"main_images": ..., "wrist_images": ..., "states": ...}
-        if "images" not in obs:
-            # Convert env format to internal format
-            if "main_images" in obs:
-                obs = {"images": [obs["main_images"]], "states": obs["states"]}
-            else:
+        device = next(self.q_head.parameters()).device
+
+        if self.config.dsrl_use_vlm_features:
+            # ---- VLM-based DSRL: use pre-computed VLM features ----
+            vlm_features = obs.get("vlm_features")
+            if vlm_features is None:
                 raise ValueError(
-                    f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
+                    "sac_q_forward: dsrl_use_vlm_features=True but obs has no 'vlm_features'."
                 )
+            vlm_features = vlm_features.to(device=device, dtype=torch.bfloat16)
+            actions = actions.to(device=device, dtype=torch.bfloat16)
 
-        # Preprocess images: resize to 64x64, use only agentview camera
-        # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
-        images = self._preprocess_dsrl_images(obs["images"], train=train)
-        states = self._preprocess_states(obs["states"])
+            if detach_encoder:
+                vlm_features = vlm_features.detach()
 
-        # Move to the same device as critic encoders, convert to bfloat16
-        device = next(self.critic_image_encoder.parameters()).device
-        images = images.to(device=device, dtype=torch.bfloat16)
-        states = states.to(device=device, dtype=torch.bfloat16)
-        actions = actions.to(device=device, dtype=torch.bfloat16)
+            if actions.dim() == 3:
+                actions = actions[:, 0, :]
 
-        # Extract features (using critic's independent encoder)
-        image_features = self.critic_image_encoder(images)
-        state_features = self.critic_state_encoder(states)
+            bsize = vlm_features.shape[0]
+            empty_state = torch.empty(bsize, 0, device=device, dtype=torch.bfloat16)
+            q_values = self.q_head(empty_state, vlm_features, actions)
+        else:
+            # ---- Original lightweight DSRL ----
+            if "images" not in obs:
+                if "main_images" in obs:
+                    obs = {"images": [obs["main_images"]], "states": obs["states"]}
+                else:
+                    raise ValueError(
+                        f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
+                    )
+            images = self._preprocess_dsrl_images(obs["images"], train=train)
+            states = self._preprocess_states(obs["states"])
+            device = next(self.critic_image_encoder.parameters()).device
+            images = images.to(device=device, dtype=torch.bfloat16)
+            states = states.to(device=device, dtype=torch.bfloat16)
+            actions = actions.to(device=device, dtype=torch.bfloat16)
 
-        # Optionally detach encoder
-        if detach_encoder:
-            image_features = image_features.detach()
-            state_features = state_features.detach()
+            image_features = self.critic_image_encoder(images)
+            state_features = self.critic_state_encoder(states)
 
-        # Process actions (DSRL: should be noise, already flattened)
-        if actions.dim() == 3:
-            actions = actions[:, 0, :]  # [B, action_horizon, dim] -> [B, dim]
+            if detach_encoder:
+                image_features = image_features.detach()
+                state_features = state_features.detach()
 
-        # Compute Q values
-        q_values = self.q_head(state_features, image_features, actions)
+            if actions.dim() == 3:
+                actions = actions[:, 0, :]
+
+            q_values = self.q_head(state_features, image_features, actions)
 
         return q_values
 
