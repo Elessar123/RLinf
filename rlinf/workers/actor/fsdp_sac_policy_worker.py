@@ -370,6 +370,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         next_obs = batch["next_obs"]
         actions = batch["actions"]
 
+        # Inject VLM features from forward_inputs into obs for VLM-based DSRL
+        if use_dsrl and self.dsrl_use_vlm_features:
+            forward_inputs = batch.get("forward_inputs", {})
+            if isinstance(forward_inputs, dict) and "vlm_features" in forward_inputs:
+                curr_obs = dict(curr_obs) if isinstance(curr_obs, dict) else curr_obs
+                next_obs = dict(next_obs) if isinstance(next_obs, dict) else next_obs
+                curr_obs["vlm_features"] = forward_inputs["vlm_features"]
+                next_obs["vlm_features"] = forward_inputs["vlm_features"]
+
         with torch.no_grad():
             kwargs = {}
             if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -545,6 +554,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             agg_q = self.cfg.algorithm.get("agg_q", "min")
 
         curr_obs = batch["curr_obs"]
+        # Inject VLM features from forward_inputs into obs for VLM-based DSRL
+        if self.use_dsrl and self.dsrl_use_vlm_features:
+            forward_inputs = batch.get("forward_inputs", {})
+            if isinstance(forward_inputs, dict) and "vlm_features" in forward_inputs:
+                curr_obs = dict(curr_obs) if isinstance(curr_obs, dict) else curr_obs
+                curr_obs["vlm_features"] = forward_inputs["vlm_features"]
         kwargs = {}
         if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:
             kwargs["temperature"] = self.cfg.algorithm.sampling_params.temperature_train
@@ -593,6 +608,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
     @Worker.timer("forward_alpha")
     def forward_alpha(self, batch):
         curr_obs = batch["curr_obs"]
+        # Inject VLM features from forward_inputs into obs for VLM-based DSRL
+        if self.use_dsrl and self.dsrl_use_vlm_features:
+            forward_inputs = batch.get("forward_inputs", {})
+            if isinstance(forward_inputs, dict) and "vlm_features" in forward_inputs:
+                curr_obs = dict(curr_obs) if isinstance(curr_obs, dict) else curr_obs
+                curr_obs["vlm_features"] = forward_inputs["vlm_features"]
         with torch.no_grad():
             kwargs = {}
             if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:

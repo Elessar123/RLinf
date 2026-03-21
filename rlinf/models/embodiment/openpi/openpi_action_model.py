@@ -646,9 +646,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_values": prev_values,
             "forward_inputs": forward_inputs,
         }
-        # Cache VLM features for replay buffer (VLM-based DSRL)
+        # Cache VLM features inside forward_inputs so they reach the replay buffer
         if vlm_features is not None:
-            result["vlm_features"] = vlm_features.detach().cpu()
+            forward_inputs["vlm_features"] = vlm_features.detach().cpu()
         # Cache tokenized prompt for DSRL distillation replay buffer
         if is_dsrl_active and self.config.dsrl_use_distillation:
             result["tokenized_prompt"] = processed_obs["tokenized_prompt"].detach().cpu()
